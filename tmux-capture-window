@@ -1,0 +1,222 @@
+#!/bin/perl
+use strict;
+use utf8;
+binmode STDIN,  ":utf8";
+binmode STDOUT, ":utf8";
+use JSON;
+use Getopt::Long;
+
+sub help {
+    print "Usage: tmux-capture-window [-e -h] [-t TARGET] [-l JSON]\n";
+    print "Options:\n";
+    print "  -e            Enable escape sequences\n";
+    print "  -l JSON       Load and view saved json\n";
+    print "  -t TARGET     Target window\n";
+    print "  -h            Help\n";
+}
+
+### Main
+
+&main;
+
+sub main {
+
+    my ($target, $load, $escape, $help) = (".", -1, -1, -1);
+    GetOptions (
+        "l=s"    => \$load,
+        "t=s"    => \$target,
+        "e"      => \$escape,
+        "h|help" => \$help,
+    ) or do { print "Error in command line arguments\n"; &help; };
+
+    if ($help == 1) {
+        &help; exit;
+    } elsif ($load != -1) {
+        &view ($load, $escape);
+    } else {
+        &save ($target, $escape);
+    }
+
+}
+
+
+### Functions
+
+sub save { # save terminal
+    my ($target, $escape) = @_;
+    my @data = ();
+
+    # What info do we need for each pane.
+    my @propNames = qw/ pane_id pane_top pane_left pane_width pane_height pane_active pane_current_path pane_current_command /;
+    my $delim = "===";
+    my $fmt = join ($delim, map { "#{$_}" } @propNames);
+
+    # Iterate through panes
+    for (`tmux list-panes -F '$fmt' -t $target`) {
+        # print STDERR;
+        chomp;
+
+        # Decompose output of list-panes
+        my @propVals = split ($delim, $_);
+        my %props = ();
+        for (0 .. @propNames-1) { $props{$propNames[$_]} = $propVals[$_]; }
+
+        # Get pane id, geometry, and some other info
+        my $pane = $props{'pane_id'};
+        my $x    = $props{'pane_left'};
+        my $y    = $props{'pane_top'};
+        my $w    = $props{'pane_width'};
+        my $h    = $props{'pane_height'};
+
+        # Capture pane
+        my $escapeFlag = $escape == -1 ? "" : "-e";
+        my $capture = `tmux capture-pane $escapeFlag -p -N -t $pane`;
+        # my $capture = ""; for (`tmux capture-pane -e -p -t $pane`) { $capture .= $_ }
+
+        # Create json entry
+        my %hash = (
+            pane => $pane, x => $x, y => $y, w => $w, h => $h,
+            capture => $capture,
+            props => \%props
+        );
+        push (@data, \%hash);
+
+    }
+
+    # Print everything
+    # print to_json (\@data, { pretty => 1 });
+    print encode_json \@data;
+}
+
+sub view { # view saved json
+    my ($file, $escape) = @_;
+    open my $fh, "<:utf8", $file or die;
+    my @data = @{ decode_json <$fh> };
+
+    my @out = ();
+    my $CLEAR = '[0;39;49m';
+
+    # Iterate through panes
+    for my $hash (@data) {
+
+        # Read pane info
+        my ($pane, $x, $y, $w, $h, $capture) = ($hash->{'pane'}, $hash->{'x'}, $hash->{'y'}, $hash->{'w'}, $hash->{'h'}, $hash->{'capture'});
+
+        # Render each line
+        my $i = 0;
+        open my $fh_content, "<:utf8", \$capture or die;
+        while (<$fh_content>) {
+            chomp;
+            my $text = $escape != -1 ? $_ : &removeEscSeqs($_);
+            &render (\@out, $CLEAR . $text . $CLEAR, $x, $y+$i, $w);
+            &render (\@out, $CLEAR, $x+$w, $y+$i, 0);
+            $i++;
+        }
+
+        # Border (vertical; left-side)
+        if ($x >= 1) {
+            for ($y .. $y+$h-1) { &render (\@out, "$CLEAR|", $x-1, $_, 1); }
+        }
+        # Border (horizontal; top-side)
+        if ($y >= 1) { &render (\@out, $CLEAR . ("−" x $w), $x, $y-1, $w); }
+        # Border (corner; top-left)
+        if ($y >= 1 && $x >= 1) { &render (\@out, "$CLEAR+", $x-1, $y-1, 1); }
+
+    }
+
+    # Output everything
+    print join("\n", @out);
+}
+
+sub min {
+    my ($x, $y) = @_;
+    return $x < $y ? $x : $y;
+}
+
+sub render { # put $str in @arr at specified position, using termSubstring
+    my ($arr, $str, $x, $y, $w) = @_;
+    my $line = $arr->[$y] || '';
+    my $before = &termSubstring ($line, 0, $x);
+    my $strsub = &termSubstring ($str, 0, $w);
+    my $after  = &termSubstring ($line, $x + $w);
+    $line = $before . $strsub . $after;
+    # print "[[COORD=$x,$y,$w][STR=$str][B=$before][SS=$strsub][A=$after][LINE=$line]]\n";
+    # <STDIN>;
+    $arr->[$y] = $line;
+}
+
+sub termSubstring { # substr tailored for terminal
+    my ($str, $start, $len) = @_;
+    # Similar to substr($str, $start, $len) but,
+    #   1. Full width characters (e.g. 'あ') are considered to have width 2
+    #   2. Escape sequences (e.g. '[9m') are considered to have width 0
+    #   3. Return longest such substring i.e. include largest possible number of escape sequences at the start and the end of the returned substring.
+    #   4. If $str is short, add spaces so the width is equal to $len
+
+    my ($i, $iprev, $width, $istart, $iend) = (0, 0, 0, -1, -1);
+
+    while ($i < length($str)) {
+
+        # Save $i if necessary
+        if ($istart == -1 && $width == $start) { $istart = $i }
+        if ($iend == -1 && $width == $start + $len + 1) { $iend = $iprev }
+
+        # Update $i and $width, depending on character
+        my $ch = substr($str, $i, 1);
+
+        if ($ch eq '') { # escape sequence
+            while (substr($str, $i++, 1) ne 'm') { }
+
+        } elsif ($ch =~ /\p{East_Asian_Width=Wide}/) { # wide char
+            $iprev = $i;
+            $i     += 1;
+            $width += 2;
+
+        } else { # normal char
+            $iprev = $i;
+            $i     += 1;
+            $width += 1;
+
+        }
+    }
+
+    # If $str is short, add spaces
+    if ($istart == -1) {
+        $str .= ' ' x ($start - $width);
+        $istart = length($str);
+        $width  = $start;
+    }
+
+    # If $len was not given, return all chars after $start
+    if ((!$len) && $len != 0) {
+        return substr($str, $istart);
+    }
+
+    # If $str is short, add spaces
+    if ($iend == -1) {
+        $str .= ' ' x ($start + $len - $width);
+        $iend = length($str);
+    }
+
+    return substr($str, $istart, $iend);
+}
+
+sub removeEscSeqs { # remove all escape sequences in $str
+    my $str = @_[0];
+    my ($esc, $text) = ("", "");
+    my $i = 0;
+    while ($i < length($str)) {
+        if (substr($str, $i, 1) eq '') {
+            # there is better algo
+            my $j = $i + 1;
+            while (substr($str, $j++, 1) ne 'm') { }
+            $esc .= substr($str, $i, $j-$i);
+            $i = $j;
+        } else {
+            $text .= substr($str, $i, 1);
+            $i++;
+        }
+    }
+    return $text;
+}
+
