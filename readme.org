@@ -1,3 +1,5 @@
+#+options: toc:nil
+
 * Capture tmux window
 
 ~tmux~ has ~capture-pane~ command, but there is no command to capture (i.e. screenshot) a whole tmux window.
@@ -12,7 +14,7 @@ tmux-capture-window > sav
 # View captured content
 tmux-capture-window -l sav
 
-# Enable color (incomplete)
+# Enable color (not perfect)
 tmux-capture-window -e > sav
 tmux-capture-window -e -l sav
 
@@ -21,10 +23,12 @@ tmux-capture-window -t '@2' > sav
 #+end_src
 
 ** Help
+#+begin_src
 Usage: tmux-capture-window [-e -h] [-t TARGET] [-l JSON]
 Options:
   -e            Enable escape sequences
   -l JSON       Load and view saved json
   -t TARGET     Target window
   -h            Help
+#+end_src
 
